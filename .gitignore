@@ -1,0 +1,17 @@
+# Ignore Streamlit local secrets
+Gemini Based Projects/.streamlit/secrets.toml
+.streamlit/secrets.toml
+
+# Ignore local environment configurations
+.env
+Gemini Based Projects/.env
+
+# Ignore Python cache files
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Ignore output notes and scratch files
+*_Notes.txt
+*_Notes.py
+*.json
