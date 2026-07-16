@@ -3,6 +3,8 @@ import json
 import time
 import random
 import datetime
+import sqlite3
+import hashlib
 import streamlit as st
 import google.genai as genai
 from google.genai import types
@@ -19,8 +21,397 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Global API Key
-API_KEY = "AQ.Ab8RN6IDiksTKMSDn1MSq9fPj1yTXpPYZrBYDTVKzW_6SO_YiQ"
+# ==========================================
+# DATABASE CONFIGURATION & OPERATIONS
+# ==========================================
+DB_FILE = "eduhub.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'student',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS login_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        login_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS progress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        module_name TEXT NOT NULL,
+        progress_percentage REAL DEFAULT 0.0,
+        details BLOB,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, module_name),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        module_name TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content BLOB NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS marks_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        test_type TEXT NOT NULL,
+        test_name TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        max_score INTEGER NOT NULL,
+        percentage REAL NOT NULL,
+        details BLOB,
+        completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        chat_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        history BLOB NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    conn.commit()
+    
+    c.execute("SELECT COUNT(*) FROM users")
+    if c.fetchone()[0] == 0:
+        default_users = [
+            ("admin", hashlib.sha256("admin123".encode()).hexdigest(), "System Administrator", "admin"),
+            ("teacher", hashlib.sha256("teacher123".encode()).hexdigest(), "Course Instructor", "teacher"),
+            ("student", hashlib.sha256("student123".encode()).hexdigest(), "Student User", "student")
+        ]
+        c.executemany("INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)", default_users)
+        conn.commit()
+    conn.close()
+
+init_db()
+
+def db_hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def db_authenticate(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    pw_hash = db_hash_password(password)
+    c.execute("SELECT * FROM users WHERE username = ? AND password_hash = ?", (username, pw_hash))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def db_log_login(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO login_history (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def db_save_progress(user_id, module_name, progress_percentage, details_dict):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    details_blob = json.dumps(details_dict).encode('utf-8')
+    c.execute("""
+    INSERT INTO progress (user_id, module_name, progress_percentage, details, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id, module_name) DO UPDATE SET
+        progress_percentage = excluded.progress_percentage,
+        details = excluded.details,
+        updated_at = CURRENT_TIMESTAMP
+    """, (user_id, module_name, progress_percentage, sqlite3.Binary(details_blob)))
+    conn.commit()
+    conn.close()
+
+def db_get_progress(user_id, module_name):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM progress WHERE user_id = ? AND module_name = ?", (user_id, module_name))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        details_dict = json.loads(row['details'].decode('utf-8'))
+        return {"progress_percentage": row['progress_percentage'], "details": details_dict, "updated_at": row['updated_at']}
+    return None
+
+def db_save_report(user_id, module_name, title, content_str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    content_blob = content_str.encode('utf-8')
+    c.execute("""
+    INSERT INTO reports (user_id, module_name, title, content)
+    VALUES (?, ?, ?, ?)
+    """, (user_id, module_name, title, sqlite3.Binary(content_blob)))
+    conn.commit()
+    conn.close()
+
+def db_get_reports(user_id, module_name=None):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if module_name:
+        c.execute("SELECT * FROM reports WHERE user_id = ? AND module_name = ? ORDER BY created_at DESC", (user_id, module_name))
+    else:
+        c.execute("SELECT * FROM reports WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        results.append({
+            "id": r["id"],
+            "module_name": r["module_name"],
+            "title": r["title"],
+            "content": r["content"].decode('utf-8'),
+            "created_at": r["created_at"]
+        })
+    return results
+
+def db_save_marks(user_id, test_type, test_name, score, max_score, details_dict):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    percentage = (score / max_score) * 100 if max_score > 0 else 0
+    details_blob = json.dumps(details_dict).encode('utf-8')
+    c.execute("""
+    INSERT INTO marks_history (user_id, test_type, test_name, score, max_score, percentage, details)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, test_type, test_name, score, max_score, percentage, sqlite3.Binary(details_blob)))
+    conn.commit()
+    conn.close()
+
+def db_get_marks(user_id, test_type=None):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if test_type:
+        c.execute("SELECT * FROM marks_history WHERE user_id = ? AND test_type = ? ORDER BY completed_at DESC", (user_id, test_type))
+    else:
+        c.execute("SELECT * FROM marks_history WHERE user_id = ? ORDER BY completed_at DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        results.append({
+            "id": r["id"],
+            "test_type": r["test_type"],
+            "test_name": r["test_name"],
+            "score": r["score"],
+            "max_score": r["max_score"],
+            "percentage": r["percentage"],
+            "details": json.loads(r["details"].decode('utf-8')) if r["details"] else {},
+            "completed_at": r["completed_at"]
+        })
+    return results
+
+def db_save_chat(user_id, chat_type, title, history_list):
+    """Saves or updates a chat session for a student in SQLite."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    history_json = json.dumps(history_list)
+    # Check if a chat of this type already exists for the user
+    c.execute("SELECT id FROM chats WHERE user_id = ? AND chat_type = ?", (user_id, chat_type))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE chats SET title = ?, history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", 
+                  (title, sqlite3.Binary(history_json.encode('utf-8')), row[0]))
+    else:
+        c.execute("INSERT INTO chats (user_id, chat_type, title, history) VALUES (?, ?, ?, ?)", 
+                  (user_id, chat_type, title, sqlite3.Binary(history_json.encode('utf-8'))))
+    conn.commit()
+    conn.close()
+
+def db_get_chat(user_id, chat_type):
+    """Retrieves chat history list for a user and chat type."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT history FROM chats WHERE user_id = ? AND chat_type = ?", (user_id, chat_type))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0].decode('utf-8'))
+    return None
+
+def db_get_all_chats():
+    """Retrieves all stored student chats for administrative viewing."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT chats.id, chats.user_id, chats.chat_type, chats.title, chats.history, chats.updated_at, users.full_name, users.username
+        FROM chats
+        JOIN users ON chats.user_id = users.id
+        ORDER BY chats.updated_at DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    
+    results = []
+    for r in rows:
+        results.append({
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "username": r["username"],
+            "full_name": r["full_name"],
+            "chat_type": r["chat_type"],
+            "title": r["title"],
+            "history": json.loads(r["history"].decode('utf-8')),
+            "updated_at": r["updated_at"]
+        })
+    return results
+
+def db_admin_get_users():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, username, full_name, role, created_at FROM users ORDER BY username ASC")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_admin_create_user(username, password, full_name, role):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    pw_hash = db_hash_password(password)
+    try:
+        c.execute("INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)", (username, pw_hash, full_name, role))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    conn.close()
+    return success
+
+def db_admin_delete_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def db_admin_get_login_history():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+    SELECT lh.id, u.username, u.full_name, lh.login_time 
+    FROM login_history lh
+    JOIN users u ON lh.user_id = u.id
+    ORDER BY lh.login_time DESC
+    LIMIT 200
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_admin_get_all_marks():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+    SELECT mh.id, u.username, u.full_name, mh.test_type, mh.test_name, mh.score, mh.max_score, mh.percentage, mh.completed_at 
+    FROM marks_history mh
+    JOIN users u ON mh.user_id = u.id
+    ORDER BY mh.completed_at DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ==========================================
+# GEMINI API KEY ROTATION & SERVICE
+# ==========================================
+def get_api_key():
+    key = st.session_state.get("notes_api")
+    if key and key.strip():
+        return key.strip()
+    try:
+        keys = st.secrets.get("GEMINI_API_KEYS")
+        if keys and isinstance(keys, list):
+            return random.choice(keys)
+    except Exception:
+        pass
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        return ""
+
+def run_with_gemini(func, user_provided_key=None, *args, **kwargs):
+    if user_provided_key and user_provided_key.strip():
+        client = genai.Client(api_key=user_provided_key.strip())
+        return func(client, *args, **kwargs)
+    
+    keys = []
+    try:
+        keys_from_secrets = st.secrets.get("GEMINI_API_KEYS", [])
+        if isinstance(keys_from_secrets, list):
+            keys = list(keys_from_secrets)
+        elif keys_from_secrets:
+            keys = [keys_from_secrets]
+    except Exception:
+        pass
+    
+    if not keys:
+        try:
+            fallback = st.secrets.get("GEMINI_API_KEY")
+            if fallback:
+                keys = [fallback]
+        except Exception:
+            pass
+            
+    if not keys:
+        return func(genai.Client(), *args, **kwargs)
+    
+    random.shuffle(keys)
+    
+    last_err = None
+    for key in keys:
+        try:
+            client = genai.Client(api_key=key.strip())
+            return func(client, *args, **kwargs)
+        except Exception as e:
+            last_err = e
+            continue
+            
+    raise last_err
+
+API_KEY = get_api_key()
+
+import re
+def fix_latex(text):
+    """Convert Gemini's LaTeX delimiters to Streamlit-compatible KaTeX delimiters.
+    Gemini often returns \\(...\\) and \\[...\\] which Streamlit doesn't render.
+    This converts them to $...$ and $$...$$ respectively."""
+    if not text:
+        return text
+    # Convert display math: \[...\] → $$...$$
+    text = re.sub(r'\\\[', '$$', text)
+    text = re.sub(r'\\\]', '$$', text)
+    # Convert inline math: \(...\) → $...$
+    text = re.sub(r'\\\(', '$', text)
+    text = re.sub(r'\\\)', '$', text)
+    return text
 
 # ==========================================
 # SHARED PREMIUM GLASSMORPHIC CSS
@@ -476,9 +867,6 @@ def jee_get_fallback_paper(qs_per_subject):
 
 def jee_generate_questions_api(api_key, num_per_subject, topics):
     """Calls Gemini API to generate JEE Advanced questions."""
-    if not api_key:
-        return None
-    client = genai.Client(api_key=api_key)
     all_questions = []
     cid = 1
     for subj in ["Physics", "Chemistry", "Mathematics"]:
@@ -501,15 +889,17 @@ Distribute types evenly: "Single Correct", "Multi Correct", "Paragraph Based", "
 Return a single JSON object with a "questions" list. Do NOT wrap in markdown.
 Each question has: id, subject, type, paragraph_text, question_text, options (4 items for SC/MC/PB, empty otherwise), column_A (4 items for MtC), column_B (5 items for MtC), correct_answer, solution."""
         try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=1.0,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0)
+            def _call(client):
+                return client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=1.0,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0)
+                    )
                 )
-            )
+            response = run_with_gemini(_call, api_key)
             data = json.loads(response.text)
             if "questions" in data and len(data["questions"]) > 0:
                 for q in data["questions"]:
@@ -528,39 +918,119 @@ Each question has: id, subject, type, paragraph_text, question_text, options (4 
 
 
 # ==========================================
+# USER SESSION & AUTHENTICATION CHECK
+# ==========================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+if "username" not in st.session_state:
+    st.session_state.username = None
+if "user_fullname" not in st.session_state:
+    st.session_state.user_fullname = None
+if "user_role" not in st.session_state:
+    st.session_state.user_role = None
+
+if not st.session_state.authenticated:
+    st.markdown("""
+    <div style="text-align: center; margin-top: 50px;">
+        <h1 style="color: #14b8a6; font-size: 3.2rem; font-weight: 800; font-family: 'Outfit', sans-serif;">AS.Dev EduHub 🎓</h1>
+        <p style="color: #94a3b8; font-size: 1.25rem;">Unified Organizational Academic AI Suite</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    _, col, _ = st.columns([1.2, 1.6, 1.2])
+    with col:
+        st.markdown('<div class="glass-card" style="border-top: 4px solid #14b8a6;">', unsafe_allow_html=True)
+        st.subheader("🔑 Organizational Login")
+        login_user = st.text_input("Username", key="login_username_input")
+        login_pass = st.text_input("Password", type="password", key="login_password_input")
+        
+        if st.button("Log In 🚀", use_container_width=True, key="login_submit_btn"):
+            if not login_user or not login_pass:
+                st.error("Please enter both username and password.")
+            else:
+                user = db_authenticate(login_user, login_pass)
+                if user:
+                    st.session_state.authenticated = True
+                    st.session_state.user_id = user["id"]
+                    st.session_state.username = user["username"]
+                    st.session_state.user_fullname = user["full_name"]
+                    st.session_state.user_role = user["role"]
+                    db_log_login(user["id"])
+                    st.toast(f"Welcome back, {user['full_name']}! 🎉", icon="👋")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()
+
+
+# ==========================================
 # MAIN SIDEBAR NAVIGATION
 # ==========================================
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "🏠 Dashboard"
+
 with st.sidebar:
-    st.markdown("""
+    st.markdown(f"""
     <div style="text-align: center; padding: 15px 0;">
         <h2 style="color: #f8fafc; font-size: 2.2rem; margin-bottom: 2px;">EduHub 🎓</h2>
         <span class="hub-badge">AS.Dev Central Hub</span>
+        <div style="margin-top: 15px; font-size: 0.95rem; color: #94a3b8;">
+            👤 <b>{st.session_state.user_fullname}</b><br>
+            <span style="font-size: 0.8rem; color: #14b8a6; text-transform: uppercase; font-weight: bold;">[{st.session_state.user_role}]</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     st.markdown("---")
     
-    page = st.radio(
-        "Navigation",
-        options=[
-            "🏠 Dashboard",
-            "📝 NotesIO",
-            "⚡ RevisionIO",
-            "🗺️ RoadmapIO",
-            "🎓 JEE Igniter",
-            "✏️ DailyPractise",
-            "🎯 JEE Advanced CBT",
-            "🤖 AI Assistant",
-            "📋 About Project",
-            "👨‍💻 About Developer"
-        ],
-        label_visibility="collapsed"
-    )
+    # Back-to-Home button (always visible unless on dashboard)
+    if st.session_state.current_page != "🏠 Dashboard":
+        if st.button("🏠 Back to Dashboard", use_container_width=True, key="sidebar_home"):
+            st.session_state.current_page = "🏠 Dashboard"
+            st.rerun()
+        st.markdown(f"""
+        <div style="text-align: center; padding: 10px 0; margin: 5px 0; border-radius: 10px; background: rgba(20, 184, 166, 0.1); border: 1px solid rgba(20, 184, 166, 0.25);">
+            <span style="color: #14b8a6; font-weight: 700; font-size: 1rem;">{st.session_state.current_page}</span>
+        </div>
+        """, unsafe_allow_html=True)
     
+    # Quick navigation for admin/teacher
+    if st.session_state.user_role in ["admin", "teacher"]:
+        st.markdown("---")
+        if st.button("📊 Admin Console", use_container_width=True, key="sidebar_admin"):
+            st.session_state.current_page = "📊 Admin Console"
+            st.rerun()
+    
+    # Info pages
+    st.markdown("---")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        if st.button("📋 About", use_container_width=True, key="sidebar_about"):
+            st.session_state.current_page = "📋 About Project"
+            st.rerun()
+    with sc2:
+        if st.button("👨‍💻 Dev", use_container_width=True, key="sidebar_dev"):
+            st.session_state.current_page = "👨‍💻 About Developer"
+            st.rerun()
+
+    st.markdown("---")
+    if st.button("🚪 Log Out", use_container_width=True, key="logout_btn"):
+        st.session_state.authenticated = False
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.session_state.user_fullname = None
+        st.session_state.user_role = None
+        st.session_state.current_page = "🏠 Dashboard"
+        st.rerun()
+        
     st.markdown("---")
     st.subheader("⚙️ System Status")
     st.markdown(f"**Gemini AI:** `CONNECTED`")
     st.markdown(f"**Mode:** `Integrated`")
 
+page = st.session_state.current_page
 
 # ══════════════════════════════════════════
 # PAGE: DASHBOARD
@@ -574,12 +1044,13 @@ if page == "🏠 Dashboard":
     """, unsafe_allow_html=True)
 
     projects = [
-        {"name": "NotesIO", "desc": "Generative Study Notes & Code Architect. Synthesizes lecture topics, parses document uploads, and designs programming algorithms.", "nav": "📝 NotesIO", "style": "card-teal"},
-        {"name": "RevisionIO", "desc": "Exam Revision Planner. Tailors customized revision calendars, highlights exam traps, and offers daily revision checkpoints.", "nav": "⚡ RevisionIO", "style": "card-indigo"},
-        {"name": "RoadmapIO", "desc": "Curriculum Path Explorer. Maps out multi-stage visual learning pathways and lists conceptual checkpoints for technical skills.", "nav": "🗺️ RoadmapIO", "style": "card-purple"},
-        {"name": "JEE Igniter", "desc": "24/7 AI Mentor & Doubt Solver. Explains challenging JEE subjects and solves study blockers with step-by-step guidance.", "nav": "🎓 JEE Igniter", "style": "card-orange"},
-        {"name": "DailyPractise", "desc": "Exam Question Sheet Generator. Curates randomized, curriculum-aligned MCQ practice sheets with detailed LaTeX solutions.", "nav": "✏️ DailyPractise", "style": "card-green"},
-        {"name": "JEE Advanced CBT", "desc": "Computer-Based Exam Engine. Mimics the official JEE Advanced interface, handles timers, and evaluates performance scores.", "nav": "🎯 JEE Advanced CBT", "style": "card-rose"},
+        {"name": "NotesIO", "icon": "📝", "desc": "Generative Study Notes & Code Architect. Synthesizes lecture topics, parses document uploads, and designs programming algorithms.", "nav": "📝 NotesIO", "style": "card-teal"},
+        {"name": "RevisionIO", "icon": "⚡", "desc": "Exam Revision Planner. Tailors customized revision calendars, highlights exam traps, and offers daily revision checkpoints.", "nav": "⚡ RevisionIO", "style": "card-indigo"},
+        {"name": "RoadmapIO", "icon": "🗺️", "desc": "Curriculum Path Explorer. Maps out multi-stage visual learning pathways and lists conceptual checkpoints for technical skills.", "nav": "🗺️ RoadmapIO", "style": "card-purple"},
+        {"name": "JEE Igniter", "icon": "🎓", "desc": "24/7 AI Mentor & Doubt Solver. Explains challenging JEE subjects and solves study blockers with step-by-step guidance.", "nav": "🎓 JEE Igniter", "style": "card-orange"},
+        {"name": "DailyPractise", "icon": "✏️", "desc": "Exam Question Sheet Generator. Curates randomized, curriculum-aligned MCQ practice sheets with detailed solutions.", "nav": "✏️ DailyPractise", "style": "card-green"},
+        {"name": "JEE Advanced CBT", "icon": "🎯", "desc": "Computer-Based Exam Engine. Mimics the official JEE Advanced interface, handles timers, and evaluates performance scores.", "nav": "🎯 JEE Advanced CBT", "style": "card-rose"},
+        {"name": "AI Assistant", "icon": "🤖", "desc": "Your personal Class 12 AI Tutor. Ask doubts in Python, MySQL, Math, Physics, and Chemistry with instant answers.", "nav": "🤖 AI Assistant", "style": "card-teal"},
     ]
 
     st.subheader("🚀 Suite Modules")
@@ -589,11 +1060,13 @@ if page == "🏠 Dashboard":
         with cols[col_idx]:
             st.markdown(f"""
             <div class="glass-card {p['style']}">
-                <h3 style="margin: 0; color: #f8fafc; font-size: 1.4rem;">{p['name']}</h3>
+                <h3 style="margin: 0; color: #f8fafc; font-size: 1.4rem;">{p['icon']} {p['name']}</h3>
                 <p style="color: #94a3b8; font-size: 0.95rem; height: 75px; line-height: 1.5; margin: 12px 0 20px 0;">{p['desc']}</p>
             </div>
             """, unsafe_allow_html=True)
-            st.button(f"Open {p['name']} 🔗", key=f"dash_open_{p['name']}", use_container_width=True, help=f"Select '{p['nav']}' from the sidebar to open.")
+            if st.button(f"Open {p['name']} 🔗", key=f"dash_open_{p['name']}", use_container_width=True):
+                st.session_state.current_page = p["nav"]
+                st.rerun()
         col_idx = (col_idx + 1) % 3
         if col_idx == 0 and idx < len(projects) - 1:
             st.write("")
@@ -613,8 +1086,11 @@ elif page == "📝 NotesIO":
     if "notes_history" not in st.session_state:
         st.session_state.notes_history = []
 
+
     def notes_add_history(action_type, title, payload):
         st.session_state.notes_history.append({"type": action_type, "title": title, "payload": payload})
+        content_str = json.dumps(payload)
+        db_save_report(st.session_state.user_id, "NotesIO", f"{action_type}: {title}", content_str)
 
     # Sidebar controls
     with st.sidebar:
@@ -630,7 +1106,7 @@ elif page == "📝 NotesIO":
     </div>
     """, unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs(["📝 Note Generator Studio", "📁 Smart File Summarizer", "💻 Code Developer Engine"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📝 Note Generator Studio", "📁 Smart File Summarizer", "💻 Code Developer Engine", "📜 Saved Notes History"])
 
     # TAB 1: Note Generation
     with tab1:
@@ -651,9 +1127,10 @@ elif page == "📝 NotesIO":
                 else:
                     with st.spinner("Synthesizing comprehensive notes..."):
                         try:
-                            client = genai.Client(api_key=notes_api_key.strip())
                             prompt = f"Generate Notes on '{topic_input}' in a detailed and structured way. Subject: {subject_cat or 'General'}. Audience: {target_aud}. Detail: {note_depth}. Style: {note_tone}. Output clean Markdown format. Start directly with the notes header."
-                            response = client.models.generate_content(model=notes_model, contents=prompt)
+                            def _call(client):
+                                return client.models.generate_content(model=notes_model, contents=prompt)
+                            response = run_with_gemini(_call, notes_api_key)
                             st.session_state.notes_data = {"topic": topic_input, "content": response.text, "depth": note_depth, "tone": note_tone}
                             notes_add_history("📝 Notes", topic_input, st.session_state.notes_data)
                             st.toast("Notes synthesized! 🎉", icon="✅")
@@ -666,7 +1143,7 @@ elif page == "📝 NotesIO":
                 st.markdown(f"**Topic**: `{notes['topic']}` | **Detail**: `{notes['depth']}` | **Style**: `{notes['tone']}`")
                 st.download_button("Download Notes (.md) 📥", data=notes["content"], file_name=f"{notes['topic'].replace(' ', '_')}_Notes.md", mime="text/markdown", key="dl_notes")
                 st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                st.markdown(notes["content"])
+                st.markdown(fix_latex(notes["content"]))
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
                 st.info("Configure settings on the left and click 'Generate Notes' to begin.")
@@ -701,10 +1178,12 @@ elif page == "📝 NotesIO":
                 else:
                     with st.spinner("Analyzing..."):
                         try:
-                            client = genai.Client(api_key=notes_api_key.strip())
                             prompt = f"Summarize the following in style: {summary_style}.\nFile: {uploaded_file.name}\nContent:\n{file_text}"
-                            response = client.models.generate_content(model=notes_model, contents=prompt)
+                            def _call(client):
+                                return client.models.generate_content(model=notes_model, contents=prompt)
+                            response = run_with_gemini(_call, notes_api_key)
                             st.session_state.summary_data = {"filename": uploaded_file.name, "style": summary_style, "content": response.text}
+                            notes_add_history("📁 Summary", uploaded_file.name, st.session_state.summary_data)
                             st.toast("Summarized! 🎉", icon="✅")
                         except Exception as e:
                             st.error(f"Error: {e}")
@@ -739,9 +1218,10 @@ elif page == "📝 NotesIO":
                 else:
                     with st.spinner("Engineering source code..."):
                         try:
-                            client = genai.Client(api_key=notes_api_key.strip())
                             prompt = f"Generate Code Only for '{project_desc}' in '.{file_ext}'. Language: {lang_selected}. Style: {code_style}. Output ONLY clean executable code."
-                            response = client.models.generate_content(model=notes_model, contents=prompt)
+                            def _call(client):
+                                return client.models.generate_content(model=notes_model, contents=prompt)
+                            response = run_with_gemini(_call, notes_api_key)
                             code_output = response.text.strip()
                             if code_output.startswith("```"):
                                 lines = code_output.splitlines()
@@ -751,6 +1231,7 @@ elif page == "📝 NotesIO":
                                     lines = lines[:-1]
                                 code_output = "\n".join(lines).strip()
                             st.session_state.code_data = {"name": project_name, "ext": file_ext, "lang": lang_selected, "style": code_style, "content": code_output}
+                            notes_add_history("💻 Code", project_name, st.session_state.code_data)
                             st.toast("Code generated! 🚀", icon="✅")
                         except Exception as e:
                             st.error(f"Error: {e}")
@@ -768,6 +1249,52 @@ elif page == "📝 NotesIO":
             else:
                 st.info("Define requirements and click 'Generate Code'.")
 
+    # TAB 4: Saved Notes History
+    with tab4:
+        st.markdown('<div class="glass-card indigo-card"><h3>📜 Saved Workspace History</h3><p style="color: #94a3b8; font-size: 0.9rem;">Review and reload previously generated notes, summaries, and code templates.</p></div>', unsafe_allow_html=True)
+        past_notes = db_get_reports(st.session_state.user_id, "NotesIO")
+        if past_notes:
+            for item in past_notes:
+                with st.expander(f"{item['title']} - {item['created_at']}"):
+                    try:
+                        payload = json.loads(item['content'])
+                    except Exception:
+                        payload = {"content": item['content']}
+                    
+                    st.markdown(f"**Saved On:** {item['created_at']}")
+                    if "topic" in payload:
+                        st.markdown(f"**Topic:** `{payload['topic']}` | **Detail:** `{payload.get('depth','')}` | **Style:** `{payload.get('tone','')}`")
+                    elif "filename" in payload:
+                        st.markdown(f"**Source File:** `{payload['filename']}` | **Summary Style:** `{payload.get('style','')}`")
+                    elif "name" in payload:
+                        st.markdown(f"**Project:** `{payload['name']}` | **Language:** `{payload.get('lang','')}` | **Pattern:** `{payload.get('style','')}`")
+                        
+                    content_val = payload.get("content", "")
+                    st.download_button(
+                        f"Download {item['title']} (.md/code) 📥",
+                        content_val,
+                        file_name=f"Saved_{item['id']}.txt",
+                        key=f"dl_past_notes_{item['id']}"
+                    )
+                    
+                    if st.button("Load into Active Workspace 💻", key=f"load_past_notes_{item['id']}"):
+                        if "topic" in payload:
+                            st.session_state.notes_data = payload
+                            st.toast("Loaded notes into Generator workspace!", icon="📝")
+                        elif "filename" in payload:
+                            st.session_state.summary_data = payload
+                            st.toast("Loaded summary into Summarizer workspace!", icon="📁")
+                        elif "name" in payload:
+                            st.session_state.code_data = payload
+                            st.toast("Loaded code into Developer workspace!", icon="💻")
+                        st.rerun()
+                        
+                    st.markdown('<div class="glass-card" style="margin-top: 10px;">', unsafe_allow_html=True)
+                    st.markdown(content_val)
+                    st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.info("No saved history found in your cloud workspace database.")
+
 
 # ══════════════════════════════════════════
 # PAGE: REVISION IO
@@ -781,14 +1308,15 @@ elif page == "⚡ RevisionIO":
         st.session_state.rev_current_day = 1
 
     def rev_run_generation(api_key, target_class, subject, topic, days, hours):
-        try:
-            client = genai.Client(api_key=api_key)
+        def _call(client):
             prompt = f"You are a senior IIT/NEET faculty. Student prep: {target_class}. Subject: {subject}. Topic: {topic}. Duration: {days} days, {hours} hrs/day. Generate structured day-by-day revision plan matching NCERT. Return JSON matching the schema. Exactly {days} days."
             response = client.models.generate_content(
                 model="gemini-2.5-flash", contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=RevisionPlanSchema, temperature=0.65)
             )
             return json.loads(response.text)
+        try:
+            return run_with_gemini(_call, api_key)
         except Exception as e:
             st.error(f"Gemini API Error: {e}")
             return None
@@ -811,12 +1339,26 @@ elif page == "⚡ RevisionIO":
                         st.session_state.rev_plan_data = plan
                         st.session_state.rev_completed_days = {d["day"]: False for d in plan["days"]}
                         st.session_state.rev_current_day = 1
+                        db_save_progress(st.session_state.user_id, "RevisionIO", 0.0, {
+                            "plan": plan,
+                            "completed_days": st.session_state.rev_completed_days,
+                            "current_day": st.session_state.rev_current_day,
+                            "exam": rev_exam,
+                            "subject": rev_subject.strip(),
+                            "topic": rev_topic.strip()
+                        })
                         st.toast("Plan generated! ⚡", icon="🔥")
                         st.rerun()
         st.markdown("---")
         if st.session_state.rev_plan_data:
             pkg = {"plan": st.session_state.rev_plan_data, "completed_days": st.session_state.rev_completed_days, "view_day": st.session_state.rev_current_day}
             st.download_button("Save Plan 💾", json.dumps(pkg, indent=4), f"{st.session_state.rev_plan_data.get('topic','Revision')}_Plan.json", "application/json", use_container_width=True, key="rev_save")
+            if st.button("🗑️ Reset Current Plan", use_container_width=True, key="rev_reset_plan"):
+                st.session_state.rev_plan_data = None
+                st.session_state.rev_completed_days = {}
+                st.session_state.rev_current_day = 1
+                st.toast("Plan reset.", icon="🗑️")
+                st.rerun()
         rev_upload = st.file_uploader("Load Plan 📂", type=["json"], key="rev_upload")
         if rev_upload:
             try:
@@ -825,6 +1367,14 @@ elif page == "⚡ RevisionIO":
                     st.session_state.rev_plan_data = ld["plan"]
                     st.session_state.rev_completed_days = {int(k): bool(v) for k, v in ld["completed_days"].items()}
                     st.session_state.rev_current_day = int(ld.get("view_day", 1))
+                    db_save_progress(st.session_state.user_id, "RevisionIO", (sum(1 for v in st.session_state.rev_completed_days.values() if v) / len(ld["plan"]["days"])) * 100, {
+                        "plan": ld["plan"],
+                        "completed_days": st.session_state.rev_completed_days,
+                        "current_day": st.session_state.rev_current_day,
+                        "exam": ld["plan"].get("exam", ""),
+                        "subject": ld["plan"].get("subject", ""),
+                        "topic": ld["plan"].get("topic", "")
+                    })
                     st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -832,7 +1382,27 @@ elif page == "⚡ RevisionIO":
     st.markdown('<div class="header-box"><h1 class="header-title">RevisionIO</h1><p style="color: #14b8a6; font-size: 1.15rem; font-weight: bold; margin-top: 5px;">⚡ Competitive Revision Engine ⚡</p></div>', unsafe_allow_html=True)
 
     if st.session_state.rev_plan_data is None:
-        st.markdown('<div class="glass-card" style="text-align: center; max-width: 600px; margin: 40px auto; border-top: 4px solid #6366f1;"><h3 style="font-size: 1.8rem; color: #f8fafc;">No Plan Active</h3><p style="color: #94a3b8;">Configure in the sidebar and click Generate.</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="glass-card" style="text-align: center; max-width: 600px; margin: 40px auto; border-top: 4px solid #6366f1;"><h3 style="font-size: 1.8rem; color: #f8fafc;">No Plan Active</h3><p style="color: #94a3b8;">Configure in the sidebar and click Generate, or load a previous plan from your cloud workspace below.</p></div>', unsafe_allow_html=True)
+        db_progress = db_get_progress(st.session_state.user_id, "RevisionIO")
+        if db_progress:
+            details = db_progress["details"]
+            st.markdown(f"""
+            <div class="glass-card indigo-card" style="max-width: 600px; margin: 20px auto; text-align: center;">
+                <h4 style="color: #f8fafc; margin-bottom: 5px;">📂 Resume Cloud Plan</h4>
+                <p style="color: #94a3b8; font-size: 0.9rem;">
+                    <b>Topic:</b> {details.get('topic','N/A')}<br>
+                    <b>Subject:</b> {details.get('subject','N/A')}<br>
+                    <b>Progress:</b> {db_progress['progress_percentage']:.1f}% Completed<br>
+                    <b>Last Active:</b> {db_progress['updated_at']}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("Resume Cloud Plan ⚡", use_container_width=True, key="resume_cloud_rev_btn"):
+                st.session_state.rev_plan_data = details["plan"]
+                st.session_state.rev_completed_days = {int(k): bool(v) for k, v in details["completed_days"].items()}
+                st.session_state.rev_current_day = int(details.get("current_day", 1))
+                st.toast("Resumed revision plan from database!", icon="📂")
+                st.rerun()
     else:
         plan = st.session_state.rev_plan_data
         total_days = len(plan["days"])
@@ -845,7 +1415,18 @@ elif page == "⚡ RevisionIO":
             if day_num not in st.session_state.rev_completed_days:
                 st.session_state.rev_completed_days[day_num] = False
             is_done = st.checkbox(f"Mark Day {day_num} Completed", st.session_state.rev_completed_days.get(day_num, False), key=f"rev_comp_{day_num}")
-            st.session_state.rev_completed_days[day_num] = is_done
+            if is_done != st.session_state.rev_completed_days.get(day_num, False):
+                st.session_state.rev_completed_days[day_num] = is_done
+                done_count = sum(1 for v in st.session_state.rev_completed_days.values() if v)
+                db_save_progress(st.session_state.user_id, "RevisionIO", (done_count / total_days) * 100, {
+                    "plan": plan,
+                    "completed_days": st.session_state.rev_completed_days,
+                    "current_day": st.session_state.rev_current_day,
+                    "exam": plan.get("exam", ""),
+                    "subject": plan.get("subject", ""),
+                    "topic": plan.get("topic", "")
+                })
+                st.rerun()
             done_count = sum(1 for v in st.session_state.rev_completed_days.values() if v)
             st.progress(done_count / total_days)
             st.markdown(f"<div style='text-align: right; font-size: 0.85rem; color: #94a3b8;'>Progress: {done_count}/{total_days} ({int(done_count/total_days*100)}%)</div>", unsafe_allow_html=True)
@@ -915,28 +1496,56 @@ elif page == "🗺️ RoadmapIO":
     st.markdown(f"""<div class="stepper-container"><div class="stepper-item {'completed' if step > 0 else 'active'}"><div class="stepper-circle">{'✓' if step > 0 else '1'}</div><div class="stepper-text">Define Goal</div></div><div class="stepper-item {'completed' if step > 1 else ('active' if step == 1 else '')}"><div class="stepper-circle">{'✓' if step > 1 else '2'}</div><div class="stepper-text">Specify Context</div></div><div class="stepper-item {'active' if step == 2 else ''}"><div class="stepper-circle">3</div><div class="stepper-text">Tailored Plan</div></div></div>""", unsafe_allow_html=True)
 
     if st.session_state.road_step == 0:
-        st.markdown("### 🗺️ Define Your Learning Path or Algorithm Goal")
-        mode = st.radio("What do you want?", ["Roadmap 🗺️", "Algorithm ⚙️"], horizontal=True, key="road_mode_radio")
-        st.session_state.road_mode = "Roadmap" if "Roadmap" in mode else "Algorithm"
-        user_q = st.text_area("Enter your requirement:", value=st.session_state.road_suggested or "", placeholder="e.g. Master Go backend dev in 3 months", height=130, key="road_input")
-        _, col_r = st.columns([4, 1])
-        with col_r:
-            if st.button("Next ➔", use_container_width=True, key="road_next"):
-                if not user_q.strip():
-                    st.warning("⚠️ Provide a requirement.")
-                else:
-                    st.session_state.road_query = user_q.strip()
-                    client = road_get_client()
-                    if client:
+        road_tab1, road_tab2 = st.tabs(["🗺️ Generate New Roadmap", "📜 Saved Roadmaps"])
+        with road_tab1:
+            st.markdown("### 🗺️ Define Your Learning Path or Algorithm Goal")
+            mode = st.radio("What do you want?", ["Roadmap 🗺️", "Algorithm ⚙️"], horizontal=True, key="road_mode_radio")
+            st.session_state.road_mode = "Roadmap" if "Roadmap" in mode else "Algorithm"
+            user_q = st.text_area("Enter your requirement:", value=st.session_state.road_suggested or "", placeholder="e.g. Master Go backend dev in 3 months", height=130, key="road_input")
+            _, col_r = st.columns([4, 1])
+            with col_r:
+                if st.button("Next ➔", use_container_width=True, key="road_next"):
+                    if not user_q.strip():
+                        st.warning("⚠️ Provide a requirement.")
+                    else:
+                        st.session_state.road_query = user_q.strip()
+                        def _call(client):
+                            prompt = f"Generate exactly 3 clarifying questions for a {st.session_state.road_mode} about: '{st.session_state.road_query}'"
+                            return client.models.generate_content(model=road_model, contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=FollowUpSchema, temperature=0.7, thinking_config=types.ThinkingConfig(thinking_budget=0)))
                         with st.spinner("Analyzing..."):
                             try:
-                                prompt = f"Generate exactly 3 clarifying questions for a {st.session_state.road_mode} about: '{st.session_state.road_query}'"
-                                response = client.models.generate_content(model=road_model, contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=FollowUpSchema, temperature=0.7, thinking_config=types.ThinkingConfig(thinking_budget=0)))
+                                response = run_with_gemini(_call)
                                 st.session_state.road_followups = json.loads(response.text).get("questions", [])
                             except Exception:
                                 st.session_state.road_followups = ["What is your target language?", "What is your experience level?", "What are your constraints?"]
                             st.session_state.road_step = 1
                             st.rerun()
+                            
+        with road_tab2:
+            st.markdown("### 📜 Previously Generated Plans")
+            past_roadmaps = db_get_reports(st.session_state.user_id, "RoadmapIO")
+            if past_roadmaps:
+                for item in past_roadmaps:
+                    with st.expander(f"{item['title']} - {item['created_at']}"):
+                        st.markdown(f"**Saved On:** {item['created_at']}")
+                        st.download_button(
+                            "Download Roadmap (.md) 📥",
+                            item["content"],
+                            file_name=f"Roadmap_{item['id']}.md",
+                            key=f"dl_road_{item['id']}"
+                        )
+                        if st.button("Load Plan into Workspace ⚡", key=f"load_road_{item['id']}"):
+                            st.session_state.road_output = item["content"]
+                            st.session_state.road_query = item["title"].replace("Roadmap: ", "").replace("Algorithm: ", "")
+                            st.session_state.road_mode = "Roadmap" if "Roadmap" in item["title"] else "Algorithm"
+                            st.session_state.road_step = 2
+                            st.rerun()
+                            
+                        st.markdown('<div class="glass-card" style="margin-top: 10px;">', unsafe_allow_html=True)
+                        st.markdown(fix_latex(item["content"]))
+                        st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("No saved roadmaps found in your workspace cloud database.")
 
     elif st.session_state.road_step == 1:
         st.markdown("### 🔍 Help us optimize your results")
@@ -955,21 +1564,27 @@ elif page == "🗺️ RoadmapIO":
                 st.rerun()
             if gen:
                 st.session_state.road_answers = answers
-                client = road_get_client()
-                if client:
-                    with st.spinner("Synthesizing..."):
-                        mode = st.session_state.road_mode
-                        prompt = f"Generate a customized {mode} for: '{st.session_state.road_query}'. Answers:\n"
-                        for q, a in answers.items():
-                            prompt += f"- {q}: {a or 'No preference'}\n"
-                        prompt += "\nUse clean Markdown with structured sections."
-                        try:
-                            response = client.models.generate_content(model=road_model, contents=prompt, config=types.GenerateContentConfig(temperature=0.7, thinking_config=types.ThinkingConfig(thinking_budget=0)))
-                            st.session_state.road_output = response.text
-                            st.session_state.road_step = 2
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
+                def _call(client):
+                    mode = st.session_state.road_mode
+                    prompt = f"Generate a customized {mode} for: '{st.session_state.road_query}'. Answers:\n"
+                    for q, a in answers.items():
+                        prompt += f"- {q}: {a or 'No preference'}\n"
+                    prompt += "\nUse clean Markdown with structured sections."
+                    return client.models.generate_content(model=road_model, contents=prompt, config=types.GenerateContentConfig(temperature=0.7, thinking_config=types.ThinkingConfig(thinking_budget=0)))
+                with st.spinner("Synthesizing..."):
+                    try:
+                        response = run_with_gemini(_call)
+                        st.session_state.road_output = response.text
+                        db_save_report(
+                            st.session_state.user_id,
+                            "RoadmapIO",
+                            f"{st.session_state.road_mode}: {st.session_state.road_query}",
+                            st.session_state.road_output
+                        )
+                        st.session_state.road_step = 2
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
     elif st.session_state.road_step == 2:
         st.markdown("### 🎉 Your Optimized Plan is Ready!")
@@ -996,102 +1611,175 @@ elif page == "🎓 JEE Igniter":
     mentor_client = genai.Client(api_key=API_KEY) if API_KEY else None
     with st.sidebar:
         st.markdown("---")
-        mentor_page = st.radio("JEE Module:", ["❓ Doubt Solver", "📅 Daily Planner", "🎓 Mentor AI"], key="mentor_nav")
+    mentor_page = st.radio("JEE Module:", ["❓ Doubt Solver", "📅 Daily Planner", "🎓 Mentor AI"], key="mentor_nav")
 
     st.markdown('<div class="header-box"><h1 class="header-title">⚡ JEE Igniter AI</h1><p class="header-subtitle">Your personal 24/7 IITian Mentor, Doubt Solver, and Study Planner</p></div>', unsafe_allow_html=True)
 
     if mentor_page == "❓ Doubt Solver":
         st.header("❓ Multimodal Doubt Solver")
-        col1, col2 = st.columns(2)
-        with col1:
-            m_subject = st.selectbox("Subject", ["Physics", "Chemistry", "Mathematics"], key="m_subj")
-            m_diff = st.selectbox("Difficulty", ["JEE Main", "JEE Advanced"], key="m_diff")
-            m_file = st.file_uploader("Upload Doubt Image", type=["png", "jpg", "jpeg"], key="m_img")
-            m_image = None
-            if m_file:
-                m_image = Image.open(m_file)
-                st.image(m_image, caption="Uploaded", use_container_width=True)
-            m_text = st.text_area("Type your question:", key="m_text")
-            m_solve = st.button("Solve Doubt ⚡", key="m_solve")
-        with col2:
-            if m_solve:
-                if not mentor_client:
-                    st.error("API Key missing.")
-                elif not m_text and not m_file:
-                    st.warning("Enter a question or upload an image.")
-                else:
-                    with st.spinner("Solving..."):
-                        prompt = f"You are an elite JEE faculty for {m_subject} at {m_diff} level. Provide step-by-step solution with LaTeX."
-                        contents = []
-                        if m_image:
-                            contents.append(m_image)
-                        contents.append(f"Question: {m_text}\n\n{prompt}")
-                        try:
-                            response = mentor_client.models.generate_content(model="gemini-2.5-flash", contents=contents)
-                            st.success("Solved!")
-                            st.markdown(response.text)
-                        except Exception as e:
-                            st.error(f"Error: {e}")
+        d_tab1, d_tab2 = st.tabs(["Ask Doubt", "Saved Doubt History"])
+        with d_tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                m_subject = st.selectbox("Subject", ["Physics", "Chemistry", "Mathematics"], key="m_subj")
+                m_diff = st.selectbox("Difficulty", ["JEE Main", "JEE Advanced"], key="m_diff")
+                m_file = st.file_uploader("Upload Doubt Image", type=["png", "jpg", "jpeg"], key="m_img")
+                m_image = None
+                if m_file:
+                    m_image = Image.open(m_file)
+                    st.image(m_image, caption="Uploaded", use_container_width=True)
+                m_text = st.text_area("Type your question:", key="m_text")
+                m_solve = st.button("Solve Doubt ⚡", key="m_solve")
+            with col2:
+                if m_solve:
+                    if not m_text and not m_file:
+                        st.warning("Enter a question or upload an image.")
+                    else:
+                        with st.spinner("Solving..."):
+                            prompt = f"You are an elite JEE faculty for {m_subject} at {m_diff} level. Provide step-by-step solution with LaTeX."
+                            contents = []
+                            if m_image:
+                                contents.append(m_image)
+                            contents.append(f"Question: {m_text}\n\n{prompt}")
+                            try:
+                                def _call(client):
+                                    return client.models.generate_content(model="gemini-2.5-flash", contents=contents)
+                                response = run_with_gemini(_call)
+                                st.success("Solved!")
+                                st.markdown(fix_latex(response.text))
+                                db_save_report(
+                                    st.session_state.user_id,
+                                    "JEE Igniter (Doubt Solver)",
+                                    f"Doubt ({m_subject} {m_diff}): {m_text[:30]}...",
+                                    response.text
+                                )
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+        with d_tab2:
+            st.subheader("Saved Doubts History")
+            past_doubts = db_get_reports(st.session_state.user_id, "JEE Igniter (Doubt Solver)")
+            if past_doubts:
+                for item in past_doubts:
+                    with st.expander(f"{item['title']} - {item['created_at']}"):
+                        st.markdown(f"**Saved On:** {item['created_at']}")
+                        st.download_button(
+                            "Download Doubt Solution (.md) 📥",
+                            item["content"],
+                            file_name=f"Doubt_Solution_{item['id']}.md",
+                            key=f"dl_doubt_{item['id']}"
+                        )
+                        st.markdown('<div class="glass-card" style="margin-top: 10px;">', unsafe_allow_html=True)
+                        st.markdown(fix_latex(item["content"]))
+                        st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("No saved doubts in your database.")
 
     elif mentor_page == "📅 Daily Planner":
         st.header("📅 JEE Study Planner")
-        col1, col2 = st.columns([1, 1.2])
-        with col1:
-            target_year = st.selectbox("Target Year", ["2026", "2027", "2028"], key="mp_yr")
-            prep_mode = st.selectbox("Mode", ["Regular School", "Dummy School", "Dropper"], key="mp_mode")
-            prep_level = st.select_slider("Level", ["Beginner", "Intermediate", "Advanced"], key="mp_lvl")
-            study_hours = st.slider("Daily Hours", 4, 16, 10, key="mp_hrs")
-            backlog = st.text_area("Weak Topics (comma separated)", key="mp_backlog")
-            strong = st.multiselect("Strong Subjects", ["Physics", "Chemistry", "Mathematics"], default=["Physics"], key="mp_strong")
-            gen_plan = st.button("Generate Study Plan 📅", key="mp_gen")
-        with col2:
-            if "mp_todo" not in st.session_state:
-                st.session_state.mp_todo = [{"task": "Solve 15 PYQs", "done": False}, {"task": "Revise Inorganic 1hr", "done": False}]
-            new_task = st.text_input("➕ Add task:", key="mp_new_task")
-            if st.button("Add Task", key="mp_add"):
-                if new_task:
-                    st.session_state.mp_todo.append({"task": new_task, "done": False})
-                    st.rerun()
-            for i, item in enumerate(st.session_state.mp_todo):
-                checked = st.checkbox(item["task"], value=item["done"], key=f"mp_todo_{i}")
-                if checked != item["done"]:
-                    st.session_state.mp_todo[i]["done"] = checked
-                    st.rerun()
-        if gen_plan and mentor_client:
-            with st.spinner("Creating plan..."):
-                prompt = f"Create 7-day JEE plan. Year: {target_year}, Mode: {prep_mode}, Level: {prep_level}, Hours: {study_hours}, Weak: {backlog}, Strong: {', '.join(strong)}. Use Markdown tables."
-                try:
-                    response = mentor_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-                    st.success("Plan Ready!")
-                    st.markdown(response.text)
-                except Exception as e:
-                    st.error(f"Error: {e}")
+        p_tab1, p_tab2 = st.tabs(["Generate Plan", "Saved Plans History"])
+        with p_tab1:
+            col1, col2 = st.columns([1, 1.2])
+            with col1:
+                target_year = st.selectbox("Target Year", ["2026", "2027", "2028"], key="mp_yr")
+                prep_mode = st.selectbox("Mode", ["Regular School", "Dummy School", "Dropper"], key="mp_mode")
+                prep_level = st.select_slider("Level", ["Beginner", "Intermediate", "Advanced"], key="mp_lvl")
+                study_hours = st.slider("Daily Hours", 4, 16, 10, key="mp_hrs")
+                backlog = st.text_area("Weak Topics (comma separated)", key="mp_backlog")
+                strong = st.multiselect("Strong Subjects", ["Physics", "Chemistry", "Mathematics"], default=["Physics"], key="mp_strong")
+                gen_plan = st.button("Generate Study Plan 📅", key="mp_gen")
+            with col2:
+                if "mp_todo" not in st.session_state:
+                    st.session_state.mp_todo = [{"task": "Solve 15 PYQs", "done": False}, {"task": "Revise Inorganic 1hr", "done": False}]
+                new_task = st.text_input("➕ Add task:", key="mp_new_task")
+                if st.button("Add Task", key="mp_add"):
+                    if new_task:
+                        st.session_state.mp_todo.append({"task": new_task, "done": False})
+                        st.rerun()
+                for i, item in enumerate(st.session_state.mp_todo):
+                    checked = st.checkbox(item["task"], value=item["done"], key=f"mp_todo_{i}")
+                    if checked != item["done"]:
+                        st.session_state.mp_todo[i]["done"] = checked
+                        st.rerun()
+            if gen_plan:
+                with st.spinner("Creating plan..."):
+                    prompt = f"Create 7-day JEE plan. Year: {target_year}, Mode: {prep_mode}, Level: {prep_level}, Hours: {study_hours}, Weak: {backlog}, Strong: {', '.join(strong)}. Use Markdown tables."
+                    try:
+                        def _call(client):
+                            return client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+                        response = run_with_gemini(_call)
+                        st.success("Plan Ready!")
+                        st.markdown(fix_latex(response.text))
+                        db_save_report(
+                            st.session_state.user_id,
+                            "JEE Igniter (Daily Planner)",
+                            f"Plan ({prep_mode} {prep_level})",
+                            response.text
+                        )
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        with p_tab2:
+            st.subheader("Saved Plans History")
+            past_plans = db_get_reports(st.session_state.user_id, "JEE Igniter (Daily Planner)")
+            if past_plans:
+                for item in past_plans:
+                    with st.expander(f"{item['title']} - {item['created_at']}"):
+                        st.markdown(f"**Saved On:** {item['created_at']}")
+                        st.download_button(
+                            "Download Study Plan (.md) 📥",
+                            item["content"],
+                            file_name=f"Study_Plan_{item['id']}.md",
+                            key=f"dl_plan_{item['id']}"
+                        )
+                        st.markdown('<div class="glass-card" style="margin-top: 10px;">', unsafe_allow_html=True)
+                        st.markdown(fix_latex(item["content"]))
+                        st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("No saved plans in your database.")
 
     elif mentor_page == "🎓 Mentor AI":
         st.header("🎓 Ask an IITian - JEE Mentor AI")
         if "mentor_msgs" not in st.session_state:
-            st.session_state.mentor_msgs = [{"role": "assistant", "content": "Hey champ! I cleared JEE Advanced. Ask me anything about strategy, motivation, or study tips!"}]
+            db_chat = db_get_chat(st.session_state.user_id, "Mentor AI")
+            if db_chat:
+                st.session_state.mentor_msgs = db_chat
+            else:
+                st.session_state.mentor_msgs = [{"role": "assistant", "content": "Hey champ! I cleared JEE Advanced. Ask me anything about strategy, motivation, or study tips!"}]
+        
+        _, c_clear = st.columns([6, 1])
+        with c_clear:
+            if st.button("Clear Chat 🧹", use_container_width=True, key="mentor_clear"):
+                st.session_state.mentor_msgs = [{"role": "assistant", "content": "Hey champ! I cleared JEE Advanced. Ask me anything about strategy, motivation, or study tips!"}]
+                db_save_chat(st.session_state.user_id, "Mentor AI", "Mentor Chat", st.session_state.mentor_msgs)
+                st.rerun()
+
         for msg in st.session_state.mentor_msgs:
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                st.markdown(fix_latex(msg["content"]))
         if user_q := st.chat_input("Ask about revision, mock tests, motivation...", key="mentor_chat"):
             with st.chat_message("user"):
                 st.markdown(user_q)
             st.session_state.mentor_msgs.append({"role": "user", "content": user_q})
-            if mentor_client:
-                with st.spinner("IITian Mentor typing..."):
-                    sys_instr = "You are 'IITian Mentor', an elite JEE coach. Give practical, actionable advice. Use numbered lists."
-                    chat_log = f"System: {sys_instr}\n\nHistory:\n"
-                    for m in st.session_state.mentor_msgs:
-                        chat_log += f"{'User' if m['role']=='user' else 'Mentor'}: {m['content']}\n"
-                    chat_log += "Mentor:"
-                    try:
-                        response = mentor_client.models.generate_content(model="gemini-2.5-flash", contents=chat_log)
-                        with st.chat_message("assistant"):
-                            st.markdown(response.text)
-                        st.session_state.mentor_msgs.append({"role": "assistant", "content": response.text})
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+            with st.spinner("IITian Mentor typing..."):
+                sys_instr = "You are 'IITian Mentor', an elite JEE coach. Give practical, actionable advice. Use numbered lists."
+                chat_log = f"System: {sys_instr}\n\nHistory:\n"
+                for m in st.session_state.mentor_msgs:
+                    chat_log += f"{'User' if m['role']=='user' else 'Mentor'}: {m['content']}\n"
+                chat_log += "Mentor:"
+                try:
+                    def _call(client):
+                        return client.models.generate_content(model="gemini-2.5-flash", contents=chat_log)
+                    response = run_with_gemini(_call)
+                    with st.chat_message("assistant"):
+                        st.markdown(fix_latex(response.text))
+                    st.session_state.mentor_msgs.append({"role": "assistant", "content": response.text})
+                    db_save_chat(
+                        st.session_state.user_id,
+                        "Mentor AI",
+                        st.session_state.mentor_msgs[1]["content"][:30] if len(st.session_state.mentor_msgs) > 1 else "Mentor Chat",
+                        st.session_state.mentor_msgs
+                    )
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 
 # ══════════════════════════════════════════
@@ -1114,13 +1802,16 @@ elif page == "✏️ DailyPractise":
         st.session_state.dp_chapter = ""
     if "dp_time_spent" not in st.session_state:
         st.session_state.dp_time_spent = 0
+    if "dp_logged" not in st.session_state:
+        st.session_state.dp_logged = False
 
     def dp_generate(api_key, subject, chapter):
-        try:
-            client = genai.Client(api_key=api_key)
+        def _call(client):
             seed = random.randint(100000, 999999)
             prompt = f"CBSE Class 12 examiner. Create 15 MCQ for {subject} - {chapter}. LaTeX for math. Seed: {seed}. Return JSON."
-            response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=PracticeTestSchema, temperature=0.85))
+            return client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=PracticeTestSchema, temperature=0.85))
+        try:
+            response = run_with_gemini(_call, api_key)
             return json.loads(response.text)
         except Exception as e:
             st.error(f"Error: {e}")
@@ -1137,6 +1828,7 @@ elif page == "✏️ DailyPractise":
                 st.session_state.dp_answers = {}
                 st.session_state.dp_submitted = False
                 st.session_state.dp_start_time = None
+                st.session_state.dp_logged = False
                 st.rerun()
         else:
             if st.button("🚀 Generate 1-Hour Test", use_container_width=True, key="dp_gen"):
@@ -1150,6 +1842,7 @@ elif page == "✏️ DailyPractise":
                         st.session_state.dp_token = str(random.randint(1000, 9999))
                         st.session_state.dp_subject = dp_subj
                         st.session_state.dp_chapter = dp_chap
+                        st.session_state.dp_logged = False
                         st.rerun()
                     else:
                         st.error("Failed. Try again.")
@@ -1157,7 +1850,25 @@ elif page == "✏️ DailyPractise":
     # Landing
     if st.session_state.dp_questions is None:
         st.markdown('<div class="header-box"><h1 class="header-title">DailyPractise ✏️</h1><p class="header-subtitle">CBSE Class 12 MCQ Practice • 15 Problems • 1 Hour</p></div>', unsafe_allow_html=True)
-        st.info("Select subject and chapter from the sidebar, then click 'Generate 1-Hour Test'.")
+        dp_tab1, dp_tab2 = st.tabs(["✏️ Take Practice Exam", "📊 Test Scorecard History"])
+        with dp_tab1:
+            st.info("Select subject and chapter from the sidebar, then click 'Generate 1-Hour Test'.")
+        with dp_tab2:
+            st.subheader("My Grade History")
+            past_marks = db_get_marks(st.session_state.user_id, "DailyPractise")
+            if past_marks:
+                import pandas as pd
+                records = []
+                for idx, m in enumerate(past_marks):
+                    records.append({
+                        "Test Date": m["completed_at"],
+                        "Test Name": m["test_name"],
+                        "Score": f"{m['score']}/{m['max_score']}",
+                        "Percentage": f"{m['percentage']:.1f}%"
+                    })
+                st.dataframe(pd.DataFrame(records), use_container_width=True)
+            else:
+                st.info("No exam history recorded yet. Complete a practice test to start tracking progress.")
 
     # Running Test
     elif st.session_state.dp_questions is not None and not st.session_state.dp_submitted:
@@ -1171,14 +1882,14 @@ elif page == "✏️ DailyPractise":
         st.markdown(f'<div class="header-box"><h2 class="header-title">{st.session_state.dp_subject} Practice Exam</h2><p class="header-subtitle">Topic: {st.session_state.dp_chapter} • MCQ • Single-Select</p></div>', unsafe_allow_html=True)
         for idx, q_dict in enumerate(st.session_state.dp_questions):
             st.markdown(f'<div class="glass-card"><div style="font-size: 0.9rem; color: #94a3b8; font-weight: 600;">QUESTION {q_dict["id"]} OF 15</div></div>', unsafe_allow_html=True)
-            st.markdown(q_dict["question"])
+            st.markdown(fix_latex(q_dict["question"]))
             ca, cb = st.columns(2)
             with ca:
-                st.markdown(f"**A)** {q_dict['option_a']}")
-                st.markdown(f"**C)** {q_dict['option_c']}")
+                st.markdown(f"**A)** {fix_latex(q_dict['option_a'])}")
+                st.markdown(f"**C)** {fix_latex(q_dict['option_c'])}")
             with cb:
-                st.markdown(f"**B)** {q_dict['option_b']}")
-                st.markdown(f"**D)** {q_dict['option_d']}")
+                st.markdown(f"**B)** {fix_latex(q_dict['option_b'])}")
+                st.markdown(f"**D)** {fix_latex(q_dict['option_d'])}")
             curr = st.session_state.dp_answers.get(q_dict["id"])
             di = 0
             if curr == "A": di = 1
@@ -1203,6 +1914,27 @@ elif page == "✏️ DailyPractise":
         incorrect = sum(1 for q in questions if ua.get(q["id"]) and ua[q["id"]].upper() != q["correct_option"].strip().upper())
         unattempted = sum(1 for q in questions if ua.get(q["id"]) is None)
         pct = int(correct / 15 * 100)
+        
+        # Database Save
+        if not st.session_state.get("dp_logged", False):
+            db_save_marks(
+                st.session_state.user_id,
+                "DailyPractise",
+                f"{st.session_state.dp_subject} - {st.session_state.dp_chapter}",
+                correct,
+                15,
+                {
+                    "subject": st.session_state.dp_subject,
+                    "chapter": st.session_state.dp_chapter,
+                    "correct": correct,
+                    "incorrect": incorrect,
+                    "unattempted": unattempted,
+                    "pct": pct,
+                    "time_spent": st.session_state.dp_time_spent
+                }
+            )
+            st.session_state.dp_logged = True
+            
         st.markdown(f'<div class="header-box"><h1 class="header-title">Post-Test Analysis</h1><p class="header-subtitle">{st.session_state.dp_subject} • {st.session_state.dp_chapter}</p></div>', unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("Score", f"{correct}/15", f"{pct}%")
@@ -1219,15 +1951,16 @@ elif page == "✏️ DailyPractise":
             else:
                 badge = '<span class="badge badge-incorrect">Incorrect ✗</span>'
             st.markdown(f'<div class="glass-card"><div style="display: flex; justify-content: space-between;"><span style="color: #94a3b8; font-weight: 700;">Q{q["id"]}</span>{badge}</div></div>', unsafe_allow_html=True)
-            st.markdown(q["question"])
+            st.markdown(fix_latex(q["question"]))
             st.markdown(f"**Your Answer:** {user_a or 'None'} | **Correct:** {correct_a}")
             with st.expander("Show Solution"):
-                st.markdown(q["explanation"])
+                st.markdown(fix_latex(q["explanation"]))
         if st.button("🔄 Take Another Test", use_container_width=True, key="dp_retake"):
             st.session_state.dp_questions = None
             st.session_state.dp_answers = {}
             st.session_state.dp_submitted = False
             st.session_state.dp_start_time = None
+            st.session_state.dp_logged = False
             st.rerun()
 
 
@@ -1328,35 +2061,55 @@ elif page == "🎯 JEE Advanced CBT":
     # WELCOME
     if st.session_state.jee_state == "welcome":
         st.markdown('<div style="text-align: center; margin-bottom: 30px;"><h1 style="font-size: 3rem; background: linear-gradient(135deg, #60a5fa, #3b82f6, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">AS.Developer Test Series</h1><p style="font-size: 1.3rem; color: #94a3b8;">JEE Advanced CBT Simulator with AI-Powered Insights</p></div>', unsafe_allow_html=True)
-        _, nc, _ = st.columns([1, 2, 1])
-        with nc:
-            nv = st.text_input("👤 Your Full Name", value=st.session_state.jee_name, key="jee_name_input")
-            st.session_state.jee_name = nv.strip()
-        col1, col2 = st.columns([1.2, 1])
-        with col1:
-            st.markdown('<div class="glass-card"><h3>📝 Exam Guidelines</h3><ul><li><b>Single Correct</b>: +3, -1</li><li><b>Multi Correct</b>: +4 full, +1 partial, -2 wrong</li><li><b>Paragraph Based</b>: +3, -1</li><li><b>Integer Type</b>: +3, 0</li><li><b>Match the Column</b>: +3 full, +1 per row, -1 wrong</li></ul></div>', unsafe_allow_html=True)
-        with col2:
-            jee_time = st.slider("⏱️ Duration (Hours)", 0.5, 3.0, 3.0, 0.5, key="jee_time")
-            jee_length = st.selectbox("📊 Test Length", ["Short (5/subject, 15 total)", "Medium (10/subject, 30 total)", "Full (18/subject, 54 total)"], key="jee_length")
-            if "Short" in jee_length: jee_qps = 5
-            elif "Medium" in jee_length: jee_qps = 10
-            else: jee_qps = 18
-            jee_topics = st.text_area("🎯 Custom Chapters (Optional)", key="jee_topics")
-            if st.button("🚀 GENERATE & START EXAM", use_container_width=True, key="jee_start"):
-                if not st.session_state.jee_name:
-                    st.error("⚠️ Enter your name.")
-                else:
-                    st.session_state.jee_roll = f"AS-{random.randint(1000,9999)}-{datetime.datetime.now().year}"
-                    with st.spinner("🚀 Generating paper via Gemini AI..."):
-                        paper = jee_generate_questions_api(API_KEY, jee_qps, jee_topics)
-                        if paper:
-                            st.session_state.jee_fallback = False
-                            jee_start_test(paper, jee_time)
-                            st.rerun()
-                        else:
-                            st.session_state.jee_fallback = True
-                            jee_start_test(jee_get_fallback_paper(jee_qps), jee_time)
-                            st.rerun()
+        cbt_tab1, cbt_tab2 = st.tabs(["🎯 Take Exam Simulator", "📊 My Exam History"])
+        with cbt_tab1:
+            _, nc, _ = st.columns([1, 2, 1])
+            with nc:
+                nv = st.text_input("👤 Your Full Name", value=st.session_state.jee_name or st.session_state.user_fullname, key="jee_name_input")
+                st.session_state.jee_name = nv.strip()
+            col1, col2 = st.columns([1.2, 1])
+            with col1:
+                st.markdown('<div class="glass-card"><h3>📝 Exam Guidelines</h3><ul><li><b>Single Correct</b>: +3, -1</li><li><b>Multi Correct</b>: +4 full, +1 partial, -2 wrong</li><li><b>Paragraph Based</b>: +3, -1</li><li><b>Integer Type</b>: +3, 0</li><li><b>Match the Column</b>: +3 full, +1 per row, -1 wrong</li></ul></div>', unsafe_allow_html=True)
+            with col2:
+                jee_time = st.slider("⏱️ Duration (Hours)", 0.5, 3.0, 3.0, 0.5, key="jee_time")
+                jee_length = st.selectbox("📊 Test Length", ["Short (5/subject, 15 total)", "Medium (10/subject, 30 total)", "Full (18/subject, 54 total)"], key="jee_length")
+                if "Short" in jee_length: jee_qps = 5
+                elif "Medium" in jee_length: jee_qps = 10
+                else: jee_qps = 18
+                jee_topics = st.text_area("🎯 Custom Chapters (Optional)", key="jee_topics")
+                if st.button("🚀 GENERATE & START EXAM", use_container_width=True, key="jee_start"):
+                    if not st.session_state.jee_name:
+                        st.error("⚠️ Enter your name.")
+                    else:
+                        st.session_state.jee_roll = f"AS-{random.randint(1000,9999)}-{datetime.datetime.now().year}"
+                        with st.spinner("🚀 Generating paper via Gemini AI..."):
+                            paper = jee_generate_questions_api(API_KEY, jee_qps, jee_topics)
+                            if paper:
+                                st.session_state.jee_fallback = False
+                                st.session_state.jee_logged = False
+                                jee_start_test(paper, jee_time)
+                                st.rerun()
+                            else:
+                                st.session_state.jee_fallback = True
+                                st.session_state.jee_logged = False
+                                jee_start_test(jee_get_fallback_paper(jee_qps), jee_time)
+                                st.rerun()
+        with cbt_tab2:
+            st.subheader("My CBT Exam History")
+            past_cbt = db_get_marks(st.session_state.user_id, "JEE Advanced CBT")
+            if past_cbt:
+                import pandas as pd
+                records = []
+                for idx, m in enumerate(past_cbt):
+                    records.append({
+                        "Exam Date": m["completed_at"],
+                        "Exam Name": m["test_name"],
+                        "Score": f"{m['score']}/{m['max_score']}",
+                        "Percentage": f"{m['percentage']:.1f}%"
+                    })
+                st.dataframe(pd.DataFrame(records), use_container_width=True)
+            else:
+                st.info("No exam history recorded yet. Complete a mock test to view progress metrics.")
 
     # TEST
     elif st.session_state.jee_state == "test":
@@ -1391,10 +2144,10 @@ elif page == "🎯 JEE Advanced CBT":
             with st.container(border=True):
                 if qtype == "Paragraph Based" and cq.get("paragraph_text"):
                     st.markdown("##### 📖 Passage:")
-                    st.markdown(cq["paragraph_text"])
+                    st.markdown(fix_latex(cq["paragraph_text"]))
                     st.markdown("---")
                 st.markdown("##### Question:")
-                st.markdown(cq["question_text"])
+                st.markdown(fix_latex(cq["question_text"]))
                 st.markdown("---")
                 st.markdown("##### Select Response:")
                 uv = st.session_state.jee_responses[qid]
@@ -1513,6 +2266,28 @@ elif page == "🎯 JEE Advanced CBT":
         ts = results["total_score"]
         ss = results["subject_scores"]
         max_marks = sum(4 if q["type"] == "Multi Correct" else 3 for q in st.session_state.jee_questions)
+        
+        # Save CBT score to DB
+        if "jee_logged" not in st.session_state:
+            st.session_state.jee_logged = False
+        if not st.session_state.jee_logged:
+            db_save_marks(
+                st.session_state.user_id,
+                "JEE Advanced CBT",
+                f"JEE Advanced CBT (Roll: {st.session_state.jee_roll})",
+                ts,
+                max_marks,
+                {
+                    "roll": st.session_state.jee_roll,
+                    "scores": ss,
+                    "correct": results['correct_count'],
+                    "incorrect": results['incorrect_count'],
+                    "unattempted": results['unattempted_count'],
+                    "accuracy": (results['correct_count'] / (results['correct_count'] + results['incorrect_count']) * 100) if (results['correct_count'] + results['incorrect_count']) > 0 else 0
+                }
+            )
+            st.session_state.jee_logged = True
+            
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total", f"{ts}/{max_marks}")
         c2.metric("Physics", ss.get("Physics", 0))
@@ -1537,6 +2312,7 @@ elif page == "🎯 JEE Advanced CBT":
             st.session_state.jee_responses = {}
             st.session_state.jee_status = {}
             st.session_state.jee_chat = []
+            st.session_state.jee_logged = False
             st.rerun()
 
 
@@ -1552,22 +2328,26 @@ elif page == "🤖 AI Assistant":
     """, unsafe_allow_html=True)
 
     if "ai_messages" not in st.session_state:
-        st.session_state.ai_messages = []
+        db_chat = db_get_chat(st.session_state.user_id, "AI Assistant")
+        if db_chat:
+            st.session_state.ai_messages = db_chat
+        else:
+            st.session_state.ai_messages = []
 
-    system_instruction = "You are Antigravity-Edu, the AI Tutor in AS.Dev EduHub. Guide Class 12 CS (083) students, solve doubts in Python, MySQL, math, physics, chemistry. Use clean Markdown and LaTeX. Be encouraging and concise."
-    client = genai.Client(api_key=API_KEY)
+    system_instruction = "You are Antigravity-Edu, the AI Tutor in AS.Dev EduHub. Guide Class 12 CS (083) students, solve doubts in Python, MySQL, math, physics, chemistry. Use clean Markdown and LaTeX (use $...$ for inline math and $$...$$ for display math). Be encouraging and concise."
 
     _, col2 = st.columns([6, 1])
     with col2:
         if st.button("Clear Chat 🧹", use_container_width=True, key="ai_clear"):
-            st.session_state.ai_messages = []
+            st.session_state.ai_messages = [{"role": "assistant", "content": "Hello! I am your Antigravity-Edu tutor. How can I help you today? 🎓"}]
+            db_save_chat(st.session_state.user_id, "AI Assistant", "AI Tutor Chat", st.session_state.ai_messages)
             st.rerun()
 
     if not st.session_state.ai_messages:
         st.session_state.ai_messages.append({"role": "assistant", "content": "Hello! I am your Antigravity-Edu tutor. How can I help you today? 🎓"})
     for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            st.markdown(fix_latex(msg["content"]))
 
     if prompt := st.chat_input("Type your doubt here...", key="ai_input"):
         with st.chat_message("user"):
@@ -1579,11 +2359,142 @@ elif page == "🤖 AI Assistant":
                 try:
                     history = [f"{'User' if m['role']=='user' else 'Tutor'}: {m['content']}" for m in st.session_state.ai_messages[:-1]]
                     full = f"System: {system_instruction}\n\nHistory:\n" + "\n".join(history) + f"\nUser: {prompt}\nTutor:"
-                    response = client.models.generate_content(model="gemini-2.5-flash", contents=full)
-                    ph.markdown(response.text)
+                    def _call(client):
+                        return client.models.generate_content(model="gemini-2.5-flash", contents=full)
+                    response = run_with_gemini(_call)
+                    fixed = fix_latex(response.text)
+                    ph.markdown(fixed)
                     st.session_state.ai_messages.append({"role": "assistant", "content": response.text})
+                    db_save_chat(
+                        st.session_state.user_id,
+                        "AI Assistant",
+                        st.session_state.ai_messages[1]["content"][:30] if len(st.session_state.ai_messages) > 1 else "AI Tutor Chat",
+                        st.session_state.ai_messages
+                    )
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+
+# ══════════════════════════════════════════
+# PAGE: ADMIN CONSOLE
+# ══════════════════════════════════════════
+elif page == "📊 Admin Console":
+    st.markdown("""
+    <div class="header-box">
+        <h1 class="header-title">Admin Console</h1>
+        <p class="header-subtitle">Manage organization users, monitor student login history, and review progress records</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    admin_tab1, admin_tab2, admin_tab3, admin_tab4 = st.tabs(["👤 Manage Users", "🚪 Login Logs", "📈 Student Marksheets", "💬 Student Chats"])
+    
+    with admin_tab1:
+        st.subheader("Register New User")
+        if st.session_state.user_role != "admin":
+            st.warning("⚠️ Only Administrators can add or remove users.")
+        else:
+            with st.form("new_user_form", clear_on_submit=True):
+                new_username = st.text_input("Username (Unique)")
+                new_password = st.text_input("Password", type="password")
+                new_fullname = st.text_input("Full Name")
+                new_role = st.selectbox("Role", ["student", "teacher", "admin"])
+                submit_new_user = st.form_submit_button("Register User ➕")
+                if submit_new_user:
+                    if not new_username or not new_password or not new_fullname:
+                        st.error("Please fill all fields.")
+                    else:
+                        success = db_admin_create_user(new_username.strip(), new_password, new_fullname.strip(), new_role)
+                        if success:
+                            st.success(f"Successfully registered user '{new_username}'!")
+                        else:
+                            st.error("Username already exists.")
+        
+        st.subheader("All Active Users")
+        users_list = db_admin_get_users()
+        if users_list:
+            import pandas as pd
+            df_users = pd.DataFrame(users_list)
+            st.dataframe(df_users, use_container_width=True)
+            
+            if st.session_state.user_role == "admin":
+                st.subheader("Delete a User")
+                user_options = [(u["id"], f"{u['username']} ({u['full_name']})") for u in users_list if u["username"] != "admin"]
+                if user_options:
+                    user_to_delete = st.selectbox("Select user to delete", options=user_options, format_func=lambda x: x[1])
+                    if st.button("Delete Selected User 🗑️", type="primary"):
+                        db_admin_delete_user(user_to_delete[0])
+                        st.success(f"User deleted.")
+                        st.rerun()
+                else:
+                    st.info("No other users available to delete.")
+        else:
+            st.info("No active users found.")
+            
+    with admin_tab2:
+        st.subheader("Student Login Activity Tracker")
+        logins = db_admin_get_login_history()
+        if logins:
+            import pandas as pd
+            df_logins = pd.DataFrame(logins)
+            st.dataframe(df_logins, use_container_width=True)
+        else:
+            st.info("No login logs captured yet.")
+            
+    with admin_tab3:
+        st.subheader("Organizational Grade Book")
+        all_marks = db_admin_get_all_marks()
+        if all_marks:
+            import pandas as pd
+            df_marks = pd.DataFrame(all_marks)
+            st.dataframe(df_marks, use_container_width=True)
+        else:
+            st.info("No exam attempts recorded yet.")
+    
+    with admin_tab4:
+        st.subheader("💬 Student Chat Transcripts")
+        st.markdown("""
+        <div class="glass-card" style="margin-bottom: 15px;">
+            <p style="color: #94a3b8; margin: 0;">Review student conversations with AI Tutor and JEE Mentor to understand their doubts, 
+            learning gaps, and frequently asked topics. Use these insights to personalize your offline teaching.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        all_chats = db_get_all_chats()
+        if all_chats:
+            # Filter controls
+            chat_types = list(set(c["chat_type"] for c in all_chats))
+            student_names = list(set(f"{c['full_name']} ({c['username']})" for c in all_chats))
+            
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                filter_type = st.selectbox("Filter by Chat Type", ["All"] + chat_types, key="admin_chat_filter_type")
+            with fc2:
+                filter_student = st.selectbox("Filter by Student", ["All"] + student_names, key="admin_chat_filter_student")
+            
+            filtered = all_chats
+            if filter_type != "All":
+                filtered = [c for c in filtered if c["chat_type"] == filter_type]
+            if filter_student != "All":
+                filtered = [c for c in filtered if f"{c['full_name']} ({c['username']})" == filter_student]
+            
+            st.markdown(f"**Showing {len(filtered)} chat session(s)**")
+            
+            for chat in filtered:
+                with st.expander(f"🧑‍🎓 {chat['full_name']} ({chat['username']}) • {chat['chat_type']} • Updated: {chat['updated_at']}"):
+                    msgs = chat["history"]
+                    msg_count = len([m for m in msgs if m.get("role") == "user"])
+                    st.markdown(f"**Student messages:** {msg_count} | **Total messages:** {len(msgs)}")
+                    st.markdown("---")
+                    for msg in msgs:
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                        if role == "user":
+                            st.markdown(f"🧑‍🎓 **Student:** {content}")
+                        else:
+                            st.markdown(f"🤖 **AI:** {fix_latex(content)}")
+                        st.markdown("")
+        else:
+            st.info("No student chat records found yet. Chats are saved automatically when students use the AI Assistant or Mentor AI.")
 
 
 # ══════════════════════════════════════════
