@@ -15,3 +15,5 @@ __pycache__/
 *_Notes.txt
 *_Notes.py
 *.json
+eduhub.db
+
