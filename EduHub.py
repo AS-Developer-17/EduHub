@@ -1027,8 +1027,28 @@ with st.sidebar:
         
     st.markdown("---")
     st.subheader("⚙️ System Status")
-    st.markdown(f"**Gemini AI:** `CONNECTED`")
+    
+    # Determine API status and show config in sidebar
+    has_secrets = False
+    try:
+        if st.secrets.get("GEMINI_API_KEYS") or st.secrets.get("GEMINI_API_KEY"):
+            has_secrets = True
+    except Exception:
+        pass
+        
+    if API_KEY:
+        st.markdown(f"**Gemini AI:** `CONNECTED` 🟢")
+    else:
+        st.markdown(f"**Gemini AI:** `DISCONNECTED` 🔴")
     st.markdown(f"**Mode:** `Integrated`")
+    
+    # Render API Key configuration in sidebar if not provided in secrets, or as collapsible override if secrets are configured
+    if not has_secrets:
+        st.warning("⚠️ No default Gemini API Key found in secrets. Cloud deployment requires secrets setup or custom key below:")
+        st.text_input("Enter Gemini API Key", value=st.session_state.get("notes_api", ""), type="password", key="notes_api", help="Get a key from Google AI Studio")
+    else:
+        with st.expander("🔑 Override API Key"):
+            st.text_input("Custom Gemini API Key", value=st.session_state.get("notes_api", ""), type="password", key="notes_api", help="Overrides the default key configured in secrets.")
 
 page = st.session_state.current_page
 
@@ -1096,7 +1116,9 @@ elif page == "📝 NotesIO":
     with st.sidebar:
         st.markdown("---")
         st.subheader("⚙️ NotesIO Settings")
-        notes_api_key = st.text_input("Gemini API Key", value=API_KEY, type="password", key="notes_api")
+        # notes_api key text input is now placed globally in the main sidebar to avoid DuplicateWidgetID.
+        # We assign notes_api_key locally to keep all internal variables working.
+        notes_api_key = API_KEY
         notes_model = st.selectbox("AI Engine Model", ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"], index=0, key="notes_model")
 
     st.markdown("""
@@ -2386,7 +2408,13 @@ elif page == "📊 Admin Console":
     </div>
     """, unsafe_allow_html=True)
     
-    admin_tab1, admin_tab2, admin_tab3, admin_tab4 = st.tabs(["👤 Manage Users", "🚪 Login Logs", "📈 Student Marksheets", "💬 Student Chats"])
+    admin_tab1, admin_tab2, admin_tab3, admin_tab4, admin_tab5 = st.tabs([
+        "👤 Manage Users", 
+        "🚪 Login Logs", 
+        "📈 Student Marksheets", 
+        "💬 Student Chats",
+        "💾 Database Management"
+    ])
     
     with admin_tab1:
         st.subheader("Register New User")
@@ -2495,6 +2523,99 @@ elif page == "📊 Admin Console":
                         st.markdown("")
         else:
             st.info("No student chat records found yet. Chats are saved automatically when students use the AI Assistant or Mentor AI.")
+
+    with admin_tab5:
+        st.subheader("💾 Database Backup, Restore & Reset")
+        
+        # Database statistics
+        st.markdown("### 📊 Database Statistics")
+        try:
+            db_size = os.path.getsize(DB_FILE) / 1024.0
+        except Exception:
+            db_size = 0.0
+            
+        stats_conn = sqlite3.connect(DB_FILE)
+        stats_cursor = stats_conn.cursor()
+        
+        def run_count_query(q):
+            try:
+                stats_cursor.execute(q)
+                return stats_cursor.fetchone()[0]
+            except Exception:
+                return 0
+                
+        user_count = run_count_query("SELECT COUNT(*) FROM users")
+        login_count = run_count_query("SELECT COUNT(*) FROM login_history")
+        progress_count = run_count_query("SELECT COUNT(*) FROM progress")
+        report_count = run_count_query("SELECT COUNT(*) FROM reports")
+        marks_count = run_count_query("SELECT COUNT(*) FROM marks_history")
+        chat_count = run_count_query("SELECT COUNT(*) FROM chats")
+        stats_conn.close()
+        
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Total Users Registered", user_count)
+            st.metric("Progress Logs Saved", progress_count)
+        with col_s2:
+            st.metric("Login Logs Captured", login_count)
+            st.metric("Reports Generated", report_count)
+        with col_s3:
+            st.metric("Chat Sessions Active", chat_count)
+            st.metric("Exam Marks Records", marks_count)
+            
+        st.markdown(f"Database File Location: `{os.path.abspath(DB_FILE)}` | File Size: **{db_size:.2f} KB**")
+        st.markdown("---")
+        
+        col_m1, col_m2 = st.columns(2)
+        
+        with col_m1:
+            st.markdown("### 📥 Download Database Backup")
+            st.write("Download the current database file to keep a local backup of all users, chats, progress, and marks. You can restore this backup at any time.")
+            try:
+                with open(DB_FILE, "rb") as f:
+                    db_bytes = f.read()
+                st.download_button(
+                    label="Download Database Backup (.db) 📥",
+                    data=db_bytes,
+                    file_name="eduhub_backup.db",
+                    mime="application/x-sqlite3",
+                    key="admin_download_db_btn",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"Error reading database file: {str(e)}")
+                
+        with col_m2:
+            st.markdown("### 📤 Restore Database Backup")
+            st.write("Upload a previously downloaded `.db` backup file to restore the database. This will overwrite the current database in the container.")
+            uploaded_db = st.file_uploader("Select .db backup file", type=["db"], key="admin_upload_db_uploader")
+            if uploaded_db is not None:
+                st.warning("⚠️ WARNING: Restoring the database will overwrite all current users, progress logs, chats, and marksheets. This action cannot be undone.")
+                if st.button("Overwrite & Restore Database 🔄", type="primary", use_container_width=True, key="admin_restore_db_btn"):
+                    try:
+                        with open(DB_FILE, "wb") as f:
+                            f.write(uploaded_db.getbuffer())
+                        st.success("Database restored successfully! Reloading... 🎉")
+                        time.sleep(1.5)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error restoring database: {str(e)}")
+                        
+        st.markdown("---")
+        st.markdown("### 🚨 Reset Database to Factory Settings")
+        st.write("DANGER ZONE: This will wipe out the current SQLite database file completely and recreate the tables with the default users (`admin`, `teacher`, `student`). All other data will be lost.")
+        confirm_check = st.checkbox("I confirm that I want to delete the database and lose all user records.", key="admin_reset_db_confirm_check")
+        
+        if st.button("Wipe & Reset Database 🚨", type="primary", disabled=not confirm_check, use_container_width=True, key="admin_reset_db_btn"):
+            try:
+                if os.path.exists(DB_FILE):
+                    os.remove(DB_FILE)
+                init_db()
+                st.success("Database reset to factory settings successfully! Reloading... 🎉")
+                time.sleep(1.5)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error resetting database: {str(e)}")
 
 
 # ══════════════════════════════════════════
